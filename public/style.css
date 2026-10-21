@@ -69,6 +69,7 @@ html, body {
 }
 .auth-card input:focus { border-color: var(--accent-strong); }
 .auth-error { color: var(--red); font-size: 12px; margin: 8px 0 0; }
+.auth-hint { color: var(--muted, #71717a); font-size: 11px; line-height: 1.5; margin: 10px 0 0; }
 .btn-block { width: 100%; margin-top: 16px; }
 
 /* ---------- Buttons ---------- */

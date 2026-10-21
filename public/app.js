@@ -3,10 +3,13 @@
 (() => {
   'use strict'
 
-  const LS_PASSWORD = 'wt-password'
   const LS_TABS = 'wt-tabs'
   const LS_SHELL = 'wt-shell'
   const MAX_TABS = 8
+
+  // Secret path prefix injected by the server into <body data-prefix="...">
+  const PREFIX = (document.body && document.body.dataset.prefix) || ''
+  const api = (p) => PREFIX + p
 
   const QUICK_COMMANDS = ['uname -a', 'df -h', 'free -h', 'whoami', 'ls -la ~/.local/bin']
 
@@ -40,6 +43,7 @@
   const authForm = $('auth-form')
   const authPass = $('auth-pass')
   const authError = $('auth-error')
+  const authHint = $('auth-hint')
   const appEl = $('app')
   const statusDot = $('status-dot')
   const statusText = $('status-text')
@@ -54,6 +58,7 @@
   let hostInfo = null
   let tabs = []
   let activeTabId = ''
+  let booted = false
   const sockets = new Map()  // tabId -> socket
   const terms = new Map()    // tabId -> { term, fit, ro }
   const containers = new Map() // tabId -> HTMLElement
@@ -109,13 +114,12 @@
   function ensureSocket(tab, defaultShell) {
     if (sockets.has(tab.id)) return
     const socket = io({
-      path: '/ws/',
-      transports: ['websocket', 'polling'],
+      path: api('/ws/'),
+      transports: ['polling', 'websocket'],
       reconnection: true,
       reconnectionAttempts: 8,
       reconnectionDelay: 1000,
       timeout: 10000,
-      auth: { password: localStorage.getItem(LS_PASSWORD) || '' },
     })
     sockets.set(tab.id, socket)
 
@@ -135,9 +139,18 @@
     })
 
     socket.on('connect_error', (err) => {
-      if (String(err && err.message || '').includes('unauthorized')) {
+      const msg = String((err && err.message) || '')
+      if (msg.includes('unauthorized') || msg.includes('origin')) {
         sockets.forEach((s) => s.close())
-        showAuth(localStorage.getItem(LS_PASSWORD) ? 'Неверный пароль' : '')
+        sockets.clear()
+        showAuth('Сессия истекла — войдите снова')
+      }
+    })
+
+    socket.on('terminal:error', ({ message } = {}) => {
+      const entry = terms.get(tab.id)
+      if (entry && message) {
+        entry.term.write(`\r\n\x1b[31m${message}\x1b[0m\r\n`)
       }
     })
 
@@ -368,15 +381,66 @@
     } else {
       authError.classList.add('hidden')
     }
+    if (authHint) authHint.classList.add('hidden')
     authPass.focus()
   }
 
-  authForm.addEventListener('submit', (e) => {
+  function makePane(tab) {
+    const pane = document.createElement('div')
+    pane.className = 'term-pane'
+    pane.style.display = 'none'
+    pane.setAttribute('role', 'region')
+    pane.setAttribute('aria-label', 'Терминал ' + basename(tab.shell))
+    pane.addEventListener('click', () => {
+      const entry = terms.get(tab.id)
+      if (entry) entry.term.focus()
+    })
+    termArea.appendChild(pane)
+    containers.set(tab.id, pane)
+  }
+
+  function startApp() {
+    booted = true
+    authEl.classList.add('hidden')
+    appEl.classList.remove('hidden')
+
+    tabs = loadTabs()
+    shellSelect.value = localStorage.getItem(LS_SHELL) || ''
+
+    for (const tab of tabs) makePane(tab)
+    const defaultShell = localStorage.getItem(LS_SHELL) || ''
+    for (const tab of tabs) ensureSocket(tab, defaultShell)
+    activateTab(tabs[0].id)
+    persistTabs()
+  }
+
+  authForm.addEventListener('submit', async (e) => {
     e.preventDefault()
-    const pass = authPass.value.trim()
-    if (!pass) return
-    localStorage.setItem(LS_PASSWORD, pass)
-    window.location.reload()
+    const pass = authPass.value
+    if (!pass.trim()) return
+    authError.classList.add('hidden')
+    try {
+      const res = await fetch(api('/auth/login'), {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({ password: pass }),
+      })
+      if (res.ok) {
+        window.location.reload()
+      } else if (res.status === 429) {
+        showAuth('Слишком много попыток — подождите 15 минут')
+      } else if (res.status === 403) {
+        showAuth('Запрос заблокирован защитой (нужен браузер, не curl)')
+      } else {
+        showAuth('Неверный пароль')
+      }
+    } catch {
+      showAuth('Сеть недоступна, попробуйте ещё раз')
+    }
   })
 
   // ---- Header actions ----------------------------------------------------------------
@@ -405,34 +469,39 @@
 
   $('btn-addtab').addEventListener('click', addTab)
 
-  // ---- Boot ----------------------------------------------------------------
-  function boot() {
-    renderQuickCommands()
-    tabs = loadTabs()
-    shellSelect.value = localStorage.getItem(LS_SHELL) || ''
-
-    appEl.classList.remove('hidden')
-    setConn(false, true)
-
-    // Build terminal panes for restored tabs
-    for (const tab of tabs) {
-      const pane = document.createElement('div')
-      pane.className = 'term-pane'
-      pane.style.display = 'none'
-      pane.setAttribute('role', 'region')
-      pane.setAttribute('aria-label', 'Терминал ' + basename(tab.shell))
-      pane.addEventListener('click', () => {
-        const entry = terms.get(tab.id)
-        if (entry) entry.term.focus()
+  $('btn-logout').addEventListener('click', async () => {
+    try {
+      await fetch(api('/auth/logout'), {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
       })
-      termArea.appendChild(pane)
-      containers.set(tab.id, pane)
-    }
+    } catch { /* ignore */ }
+    window.location.reload()
+  })
 
-    const defaultShell = localStorage.getItem(LS_SHELL) || ''
-    for (const tab of tabs) ensureSocket(tab, defaultShell)
-    activateTab(tabs[0].id)
-    persistTabs()
+  // ---- Boot ----------------------------------------------------------------
+  async function boot() {
+    renderQuickCommands()
+    // Upgraders: remove the old plaintext password storage
+    try { localStorage.removeItem('wt-password') } catch { /* ignore */ }
+
+    try {
+      const res = await fetch(api('/auth/check'), { credentials: 'same-origin' })
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}))
+        if (data && data.info) {
+          hostInfo = data.info
+          renderHostBadge()
+          renderShellOptions()
+        }
+        startApp()
+      } else {
+        showAuth()
+      }
+    } catch {
+      showAuth('Сервер недоступен — проверьте, что web-terminal запущен')
+    }
   }
 
   boot()

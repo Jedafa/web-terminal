@@ -1,6 +1,6 @@
 {
   "name": "web-terminal",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Браузерный терминал с реальным PTY: xterm.js + node-pty + socket.io. Вкладки, пароль-авторизация, выбор shell. Self-hosted, как sshx.",
   "license": "MIT",
   "author": "Jedafa",
