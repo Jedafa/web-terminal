@@ -1,0 +1,14 @@
+services:
+  web-terminal:
+    build: .
+    container_name: web-terminal
+    restart: unless-stopped
+    ports:
+      - "7681:7681"
+    environment:
+      # ОБЯЗАТЕЛЬНО смените пароль перед запуском на публичном сервере!
+      - WEB_TERMINAL_PASSWORD=${WEB_TERMINAL_PASSWORD:-changeme}
+      # - WEB_TERMINAL_SHELL=/bin/zsh
+      # - WEB_TERMINAL_DIR=/home/user/project
+    # Если нужно запускать команды на хосте через docker exec — раскомментируйте:
+    # command: sh -c "npm start"
