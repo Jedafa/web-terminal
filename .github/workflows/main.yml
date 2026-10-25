@@ -1,8 +1,10 @@
-```yaml
 name: Temporary Linux SSH Server
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   ssh-server:
@@ -10,48 +12,88 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Configure SSH and root access
+      - name: Install and configure SSH
         shell: bash
         run: |
           set -euo pipefail
 
-          # Generate a random root password
-          ROOT_PASSWORD="$(openssl rand -base64 24)"
+          echo "Installing OpenSSH..."
 
-          # Install OpenSSH server
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server curl
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            openssh-server \
+            curl \
+            openssl
 
-          # Configure root login using a password
+          echo "Generating random root password..."
+          ROOT_PASSWORD="$(openssl rand -hex 24)"
+
           echo "root:${ROOT_PASSWORD}" | sudo chpasswd
 
           sudo mkdir -p /run/sshd
-          sudo sed -i \
-            -e 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' \
-            -e 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' \
-            /etc/ssh/sshd_config
-
-          # Ensure SSH listens on port 3000
           sudo mkdir -p /etc/ssh/sshd_config.d
-          echo "Port 3000" | sudo tee /etc/ssh/sshd_config.d/99-custom-port.conf
+
+          sudo tee /etc/ssh/sshd_config.d/99-github-runner.conf >/dev/null <<'EOF'
+          PermitRootLogin yes
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          Port 3000
+          EOF
 
           sudo sshd -t
-          sudo systemctl restart ssh || sudo service ssh restart
 
-          echo
-          echo "========================================"
-          echo "ROOT PASSWORD: ${ROOT_PASSWORD}"
-          echo "SSH PORT: 3000"
-          echo "========================================"
-          echo
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+
+          if ! sudo systemctl is-active --quiet ssh; then
+            echo "SSH service failed to start."
+            sudo journalctl -u ssh --no-pager -n 50
+            exit 1
+          fi
+
+          {
+            echo "## SSH server"
+            echo
+            echo "- Username: root"
+            echo "- SSH port: 3000"
+            echo
+            echo "The password is available in the step logs."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "SSH service is running."
+
+          # Mask the password in GitHub Actions logs.
+          echo "::add-mask::${ROOT_PASSWORD}"
+
+          # Store credentials for the tunnel step without printing the password.
+          printf '%s' "$ROOT_PASSWORD" > "$RUNNER_TEMP/ssh_root_password"
+          chmod 600 "$RUNNER_TEMP/ssh_root_password"
 
       - name: Install Localport
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL https://localport.io/install.sh -o /tmp/localport-install.sh
-          sudo sh /tmp/localport-install.sh
-          rm -f /tmp/localport-install.sh
+
+          curl -fsSL \
+            https://localport.io/install.sh \
+            -o "$RUNNER_TEMP/localport-install.sh"
+
+          sudo sh "$RUNNER_TEMP/localport-install.sh"
+
+          rm -f "$RUNNER_TEMP/localport-install.sh"
+
+          if ! command -v localport >/dev/null 2>&1; then
+            echo "Localport executable was not found in PATH."
+
+            if [ -x /usr/local/bin/localport ]; then
+              echo "/usr/local/bin/localport exists."
+            fi
+
+            exit 1
+          fi
+
+          echo "Localport installed successfully."
 
       - name: Start TCP tunnel
         shell: bash
@@ -60,24 +102,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "$LOCALPORT_TOKEN" ]; then
-            echo "Missing LOCALPORT_TOKEN GitHub secret."
+          if [ -z "${LOCALPORT_TOKEN:-}" ]; then
+            echo "ERROR: Configure LOCALPORT_TOKEN in repository secrets."
             exit 1
           fi
 
-          # Start tunnel and keep the workflow alive.
+          echo "Starting Localport TCP tunnel..."
+          echo "Local SSH port: 3000"
+          echo "Region: eu"
+
           localport tcp 3000 \
             --token "$LOCALPORT_TOKEN" \
             --region eu &
+          
           TUNNEL_PID=$!
 
-          trap 'kill "$TUNNEL_PID" 2>/dev/null || true' EXIT
+          cleanup() {
+            kill "$TUNNEL_PID" 2>/dev/null || true
+          }
 
-          # Keep the runner active while checking the tunnel process.
+          trap cleanup EXIT INT TERM
+
           while kill -0 "$TUNNEL_PID" 2>/dev/null; do
-            sleep 10
+            sleep 5
           done
 
-          echo "Localport stopped."
-          exit 1
-```
+          echo "ERROR: Localport stopped."
+          wait "$TUNNEL_PID"
