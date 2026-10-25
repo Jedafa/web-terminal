@@ -3,6 +3,10 @@ name: Temporary Linux SSH Server
 on:
   workflow_dispatch:
 
+concurrency:
+  group: localport-ssh-tunnel
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -25,7 +29,6 @@ jobs:
             curl \
             openssl
 
-          echo "Generating random root password..."
           ROOT_PASSWORD="$(openssl rand -hex 24)"
 
           echo "root:${ROOT_PASSWORD}" | sudo chpasswd
@@ -42,58 +45,54 @@ jobs:
           EOF
 
           sudo sshd -t
-
           sudo systemctl enable ssh
           sudo systemctl restart ssh
 
           if ! sudo systemctl is-active --quiet ssh; then
-            echo "SSH service failed to start."
+            echo "SSH failed to start."
             sudo journalctl -u ssh --no-pager -n 50
             exit 1
           fi
 
+          echo "::add-mask::${ROOT_PASSWORD}"
+
+          # Keep the password available to later steps.
+          printf '%s' "$ROOT_PASSWORD" > "$RUNNER_TEMP/ssh_root_password"
+          chmod 600 "$RUNNER_TEMP/ssh_root_password"
+
           {
             echo "## SSH server"
             echo
-            echo "- Username: root"
-            echo "- SSH port: 3000"
+            echo "Username: root"
+            echo "SSH local port: 3000"
             echo
-            echo "The password is available in the step logs."
+            echo "The randomly generated password is masked in the logs."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "SSH service is running."
-
-          # Mask the password in GitHub Actions logs.
-          echo "::add-mask::${ROOT_PASSWORD}"
-
-          # Store credentials for the tunnel step without printing the password.
-          printf '%s' "$ROOT_PASSWORD" > "$RUNNER_TEMP/ssh_root_password"
-          chmod 600 "$RUNNER_TEMP/ssh_root_password"
+          echo "SSH is running on port 3000."
 
       - name: Install Localport
         shell: bash
         run: |
           set -euo pipefail
 
-          curl -fsSL \
-            https://localport.io/install.sh \
+          curl -fsSL https://localport.io/install.sh \
             -o "$RUNNER_TEMP/localport-install.sh"
 
           sudo sh "$RUNNER_TEMP/localport-install.sh"
-
           rm -f "$RUNNER_TEMP/localport-install.sh"
 
           if ! command -v localport >/dev/null 2>&1; then
-            echo "Localport executable was not found in PATH."
+            echo "ERROR: localport executable not found in PATH."
 
             if [ -x /usr/local/bin/localport ]; then
-              echo "/usr/local/bin/localport exists."
+              echo "Executable exists at /usr/local/bin/localport."
             fi
 
             exit 1
           fi
 
-          echo "Localport installed successfully."
+          echo "Localport installed."
 
       - name: Start TCP tunnel
         shell: bash
@@ -103,26 +102,29 @@ jobs:
           set -euo pipefail
 
           if [ -z "${LOCALPORT_TOKEN:-}" ]; then
-            echo "ERROR: Configure LOCALPORT_TOKEN in repository secrets."
+            echo "ERROR: LOCALPORT_TOKEN secret is missing."
             exit 1
           fi
+
+          # Avoid exposing the token as a command-line argument.
+          export LOCALPORT_TOKEN
 
           echo "Starting Localport TCP tunnel..."
           echo "Local SSH port: 3000"
           echo "Region: eu"
 
           localport tcp 3000 \
-            --token "$LOCALPORT_TOKEN" \
             --region eu &
-          
           TUNNEL_PID=$!
 
           cleanup() {
             kill "$TUNNEL_PID" 2>/dev/null || true
+            wait "$TUNNEL_PID" 2>/dev/null || true
           }
 
           trap cleanup EXIT INT TERM
 
+          # Keep the job alive while the tunnel is running.
           while kill -0 "$TUNNEL_PID" 2>/dev/null; do
             sleep 5
           done
