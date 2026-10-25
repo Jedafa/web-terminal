@@ -3,7 +3,6 @@ name: Temporary Linux SSH Server
 on:
   workflow_dispatch:
 
-# Не допускаем параллельных запусков этого workflow.
 concurrency:
   group: localport-ssh-tunnel
   cancel-in-progress: false
@@ -20,17 +19,34 @@ jobs:
       - name: Install and configure SSH
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
+          echo "========== SYSTEM INFORMATION =========="
+          date -u
+          uname -a
+          df -h /
+          free -h || true
+
+          echo "========== INSTALLING SSH =============="
 
           sudo apt-get update
+
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            openssh-server openssl curl
+            openssh-server \
+            openssl \
+            curl \
+            iproute2 \
+            procps
+
+          echo "========== GENERATING PASSWORD ========="
 
           ROOT_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::${ROOT_PASSWORD}"
 
           echo "root:${ROOT_PASSWORD}" | sudo chpasswd
 
-          sudo mkdir -p /run/sshd /etc/ssh/sshd_config.d
+          sudo mkdir -p /run/sshd
+          sudo mkdir -p /etc/ssh/sshd_config.d
 
           sudo tee /etc/ssh/sshd_config.d/99-github-runner.conf >/dev/null <<'EOF'
           PermitRootLogin yes
@@ -39,54 +55,159 @@ jobs:
           Port 3000
           EOF
 
+          echo "========== VALIDATING SSH =============="
+
           sudo sshd -t
+
+          echo "SSH configuration is valid."
+
+          sudo systemctl enable ssh
           sudo systemctl restart ssh
-          sudo systemctl is-active --quiet ssh
 
-          # Keep the generated password available only to this job.
-          printf '%s' "$ROOT_PASSWORD" > "$RUNNER_TEMP/ssh_root_password"
+          if ! sudo systemctl is-active --quiet ssh; then
+            echo "ERROR: SSH service is not active."
+            sudo systemctl status ssh --no-pager || true
+            sudo journalctl -u ssh --no-pager -n 100 || true
+            exit 1
+          fi
+
+          echo "========== VERIFYING PORT =============="
+
+          sudo ss -lntp
+          sudo ss -lntp | grep -E '[:.]3000[[:space:]]' || {
+            echo "ERROR: Nothing is listening on port 3000."
+            exit 1
+          }
+
+          echo "========== SSH STATUS ==================="
+          sudo systemctl status ssh --no-pager || true
+
+          echo "SSH setup completed successfully."
+
+          # Password stays masked and is not printed.
+          # Save it privately in the runner's temporary directory.
+          printf '%s' "$ROOT_PASSWORD" \
+            > "$RUNNER_TEMP/ssh_root_password"
+
           chmod 600 "$RUNNER_TEMP/ssh_root_password"
-
-          # Mask the password in workflow logs.
-          echo "::add-mask::${ROOT_PASSWORD}"
-
-          echo "SSH server started on local port 3000."
+          unset ROOT_PASSWORD
 
       - name: Install Localport
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          curl -fsSL https://localport.io/install.sh \
+          echo "========== LOCALPORT INSTALLATION ======"
+
+          curl -fsSL \
+            https://localport.io/install.sh \
             -o "$RUNNER_TEMP/localport-install.sh"
 
           sudo sh "$RUNNER_TEMP/localport-install.sh"
+
           rm -f "$RUNNER_TEMP/localport-install.sh"
 
           if ! command -v localport >/dev/null 2>&1; then
-            echo "ERROR: Localport executable not found."
-            exit 1
+            echo "ERROR: localport is not in PATH."
+
+            if [ -x /usr/local/bin/localport ]; then
+              echo "Found executable at /usr/local/bin/localport."
+              export PATH="/usr/local/bin:$PATH"
+            else
+              echo "Executable not found at the expected location."
+              exit 1
+            fi
           fi
 
-          echo "Localport installed."
+          echo "========== LOCALPORT VERSION ==========="
 
-      - name: Start Localport exactly once
+          localport --version
+
+          echo "========== LOCALPORT HELP ==============="
+
+          localport --help || true
+
+          echo "Localport installation completed."
+
+      - name: Start tunnel with detailed diagnostics
         shell: bash
         env:
           LOCALPORT_TOKEN: ${{ secrets.LOCALPORT_TOKEN }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
+          echo "========== TUNNEL DIAGNOSTICS ==========="
+          date -u
 
           if [ -z "${LOCALPORT_TOKEN:-}" ]; then
             echo "ERROR: LOCALPORT_TOKEN secret is missing."
             exit 1
           fi
 
-          echo "Starting one Localport session."
-          echo "Local TCP port: 3000"
-          echo "Region: eu"
-          echo "Automatic retries: disabled"
+          echo "Checking local SSH port..."
 
-          # No background process, retry loop, or second invocation.
-          # Localport receives its token through the environment.
-          exec localport tcp 3000 --region eu
+          if ! sudo ss -lnt | grep -E '[:.]3000[[:space:]]'; then
+            echo "ERROR: SSH is not listening on port 3000."
+            sudo systemctl status ssh --no-pager || true
+            exit 1
+          fi
+
+          echo "Local SSH port is listening."
+
+          echo "========== TOKEN FILE ==================="
+
+          TOKEN_FILE="$RUNNER_TEMP/localport-token"
+
+          umask 077
+          printf '%s' "$LOCALPORT_TOKEN" > "$TOKEN_FILE"
+          chmod 600 "$TOKEN_FILE"
+
+          unset LOCALPORT_TOKEN
+
+          export LOCALPORT_TOKEN_FILE="$TOKEN_FILE"
+          export NO_COLOR=1
+          export TERM=dumb
+
+          echo "Token stored in a private temporary file."
+          echo "Token contents will not be printed."
+          echo "Automatic restart: disabled."
+          echo "Tunnel invocations: one."
+          echo "Local address: localhost:3000"
+          echo "Region: eu"
+
+          echo "========== STARTING LOCALPORT ==========="
+
+          START_TIME="$(date +%s)"
+
+          set +e
+          localport tcp 3000 --region eu --noui
+          EXIT_CODE=$?
+          set -e
+
+          END_TIME="$(date +%s)"
+          DURATION=$((END_TIME - START_TIME))
+
+          echo "========== LOCALPORT EXIT REPORT ========"
+          echo "Start time: $(date -u -d "@$START_TIME" '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "End time:   $(date -u -d "@$END_TIME" '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Duration:   ${DURATION} seconds"
+          echo "Exit code:  ${EXIT_CODE}"
+
+          echo "========== SSH SERVICE AFTER EXIT ========"
+          sudo systemctl status ssh --no-pager || true
+
+          echo "========== PORT STATUS AFTER EXIT ======="
+          sudo ss -lntp || true
+
+          echo "========== RECENT SSH LOGS ==============="
+          sudo journalctl -u ssh --no-pager -n 50 || true
+
+          rm -f "$TOKEN_FILE"
+
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "ERROR: Localport exited with a non-zero status."
+            echo "Review the Localport logs above."
+            exit "$EXIT_CODE"
+          fi
+
+          echo "Localport exited normally."
