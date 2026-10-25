@@ -1,0 +1,83 @@
+```yaml
+name: Temporary Linux SSH Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ssh-server:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure SSH and root access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Generate a random root password
+          ROOT_PASSWORD="$(openssl rand -base64 24)"
+
+          # Install OpenSSH server
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server curl
+
+          # Configure root login using a password
+          echo "root:${ROOT_PASSWORD}" | sudo chpasswd
+
+          sudo mkdir -p /run/sshd
+          sudo sed -i \
+            -e 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' \
+            -e 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' \
+            /etc/ssh/sshd_config
+
+          # Ensure SSH listens on port 3000
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          echo "Port 3000" | sudo tee /etc/ssh/sshd_config.d/99-custom-port.conf
+
+          sudo sshd -t
+          sudo systemctl restart ssh || sudo service ssh restart
+
+          echo
+          echo "========================================"
+          echo "ROOT PASSWORD: ${ROOT_PASSWORD}"
+          echo "SSH PORT: 3000"
+          echo "========================================"
+          echo
+
+      - name: Install Localport
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://localport.io/install.sh -o /tmp/localport-install.sh
+          sudo sh /tmp/localport-install.sh
+          rm -f /tmp/localport-install.sh
+
+      - name: Start TCP tunnel
+        shell: bash
+        env:
+          LOCALPORT_TOKEN: ${{ secrets.LOCALPORT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$LOCALPORT_TOKEN" ]; then
+            echo "Missing LOCALPORT_TOKEN GitHub secret."
+            exit 1
+          fi
+
+          # Start tunnel and keep the workflow alive.
+          localport tcp 3000 \
+            --token "$LOCALPORT_TOKEN" \
+            --region eu &
+          TUNNEL_PID=$!
+
+          trap 'kill "$TUNNEL_PID" 2>/dev/null || true' EXIT
+
+          # Keep the runner active while checking the tunnel process.
+          while kill -0 "$TUNNEL_PID" 2>/dev/null; do
+            sleep 10
+          done
+
+          echo "Localport stopped."
+          exit 1
+```
