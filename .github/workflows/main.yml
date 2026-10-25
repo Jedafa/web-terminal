@@ -3,9 +3,10 @@ name: Temporary Linux SSH Server
 on:
   workflow_dispatch:
 
+# Не допускаем параллельных запусков этого workflow.
 concurrency:
   group: localport-ssh-tunnel
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -21,55 +22,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Installing OpenSSH..."
-
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            openssh-server \
-            curl \
-            openssl
+            openssh-server openssl curl
 
           ROOT_PASSWORD="$(openssl rand -hex 24)"
 
           echo "root:${ROOT_PASSWORD}" | sudo chpasswd
 
-          sudo mkdir -p /run/sshd
-          sudo mkdir -p /etc/ssh/sshd_config.d
+          sudo mkdir -p /run/sshd /etc/ssh/sshd_config.d
 
           sudo tee /etc/ssh/sshd_config.d/99-github-runner.conf >/dev/null <<'EOF'
           PermitRootLogin yes
           PasswordAuthentication yes
           KbdInteractiveAuthentication no
-          PubkeyAuthentication yes
           Port 3000
           EOF
 
           sudo sshd -t
-          sudo systemctl enable ssh
           sudo systemctl restart ssh
+          sudo systemctl is-active --quiet ssh
 
-          if ! sudo systemctl is-active --quiet ssh; then
-            echo "SSH failed to start."
-            sudo journalctl -u ssh --no-pager -n 50
-            exit 1
-          fi
-
-          echo "::add-mask::${ROOT_PASSWORD}"
-
-          # Keep the password available to later steps.
+          # Keep the generated password available only to this job.
           printf '%s' "$ROOT_PASSWORD" > "$RUNNER_TEMP/ssh_root_password"
           chmod 600 "$RUNNER_TEMP/ssh_root_password"
 
-          {
-            echo "## SSH server"
-            echo
-            echo "Username: root"
-            echo "SSH local port: 3000"
-            echo
-            echo "The randomly generated password is masked in the logs."
-          } >> "$GITHUB_STEP_SUMMARY"
+          # Mask the password in workflow logs.
+          echo "::add-mask::${ROOT_PASSWORD}"
 
-          echo "SSH is running on port 3000."
+          echo "SSH server started on local port 3000."
 
       - name: Install Localport
         shell: bash
@@ -83,18 +64,13 @@ jobs:
           rm -f "$RUNNER_TEMP/localport-install.sh"
 
           if ! command -v localport >/dev/null 2>&1; then
-            echo "ERROR: localport executable not found in PATH."
-
-            if [ -x /usr/local/bin/localport ]; then
-              echo "Executable exists at /usr/local/bin/localport."
-            fi
-
+            echo "ERROR: Localport executable not found."
             exit 1
           fi
 
           echo "Localport installed."
 
-      - name: Start TCP tunnel
+      - name: Start Localport exactly once
         shell: bash
         env:
           LOCALPORT_TOKEN: ${{ secrets.LOCALPORT_TOKEN }}
@@ -106,28 +82,11 @@ jobs:
             exit 1
           fi
 
-          # Avoid exposing the token as a command-line argument.
-          export LOCALPORT_TOKEN
-
-          echo "Starting Localport TCP tunnel..."
-          echo "Local SSH port: 3000"
+          echo "Starting one Localport session."
+          echo "Local TCP port: 3000"
           echo "Region: eu"
+          echo "Automatic retries: disabled"
 
-          localport tcp 3000 \
-            --region eu &
-          TUNNEL_PID=$!
-
-          cleanup() {
-            kill "$TUNNEL_PID" 2>/dev/null || true
-            wait "$TUNNEL_PID" 2>/dev/null || true
-          }
-
-          trap cleanup EXIT INT TERM
-
-          # Keep the job alive while the tunnel is running.
-          while kill -0 "$TUNNEL_PID" 2>/dev/null; do
-            sleep 5
-          done
-
-          echo "ERROR: Localport stopped."
-          wait "$TUNNEL_PID"
+          # No background process, retry loop, or second invocation.
+          # Localport receives its token through the environment.
+          exec localport tcp 3000 --region eu
