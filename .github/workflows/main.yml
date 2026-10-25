@@ -21,26 +21,21 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          echo "========== SYSTEM INFORMATION =========="
+          echo "========== SYSTEM =========="
           date -u
           uname -a
           df -h /
           free -h || true
 
-          echo "========== INSTALLING SSH =============="
+          echo "========== INSTALL SSH =========="
 
           sudo apt-get update
-
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            openssh-server \
-            openssl \
-            curl \
-            iproute2 \
-            procps
-
-          echo "========== GENERATING PASSWORD ========="
+            openssh-server openssl curl iproute2 procps
 
           ROOT_PASSWORD="$(openssl rand -hex 24)"
+
+          # Mask password in workflow logs.
           echo "::add-mask::${ROOT_PASSWORD}"
 
           echo "root:${ROOT_PASSWORD}" | sudo chpasswd
@@ -55,158 +50,177 @@ jobs:
           Port 3000
           EOF
 
-          echo "========== VALIDATING SSH =============="
-
           sudo sshd -t
-
-          echo "SSH configuration is valid."
-
           sudo systemctl enable ssh
           sudo systemctl restart ssh
 
-          if ! sudo systemctl is-active --quiet ssh; then
-            echo "ERROR: SSH service is not active."
-            sudo systemctl status ssh --no-pager || true
-            sudo journalctl -u ssh --no-pager -n 100 || true
+          sudo systemctl is-active --quiet ssh
+
+          if ! sudo ss -lnt | grep -E '[:.]3000[[:space:]]'; then
+            echo "ERROR: SSH port 3000 is not listening."
             exit 1
           fi
 
-          echo "========== VERIFYING PORT =============="
-
-          sudo ss -lntp
-          sudo ss -lntp | grep -E '[:.]3000[[:space:]]' || {
-            echo "ERROR: Nothing is listening on port 3000."
-            exit 1
-          }
-
-          echo "========== SSH STATUS ==================="
-          sudo systemctl status ssh --no-pager || true
-
-          echo "SSH setup completed successfully."
-
-          # Password stays masked and is not printed.
-          # Save it privately in the runner's temporary directory.
-          printf '%s' "$ROOT_PASSWORD" \
-            > "$RUNNER_TEMP/ssh_root_password"
-
+          # Save credentials for the tunnel step.
+          printf '%s' "$ROOT_PASSWORD" > "$RUNNER_TEMP/ssh_root_password"
           chmod 600 "$RUNNER_TEMP/ssh_root_password"
+
+          # Keep password available for the summary.
           unset ROOT_PASSWORD
+
+          echo "SSH started successfully on port 3000."
 
       - name: Install Localport
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          echo "========== LOCALPORT INSTALLATION ======"
+          echo "========== INSTALL LOCALPORT =========="
 
-          curl -fsSL \
-            https://localport.io/install.sh \
+          curl -fsSL https://localport.io/install.sh \
             -o "$RUNNER_TEMP/localport-install.sh"
 
           sudo sh "$RUNNER_TEMP/localport-install.sh"
-
           rm -f "$RUNNER_TEMP/localport-install.sh"
 
           if ! command -v localport >/dev/null 2>&1; then
-            echo "ERROR: localport is not in PATH."
-
-            if [ -x /usr/local/bin/localport ]; then
-              echo "Found executable at /usr/local/bin/localport."
-              export PATH="/usr/local/bin:$PATH"
-            else
-              echo "Executable not found at the expected location."
-              exit 1
-            fi
+            echo "ERROR: localport executable not found."
+            exit 1
           fi
 
-          echo "========== LOCALPORT VERSION ==========="
+          localport version
 
-          localport --version
-
-          echo "========== LOCALPORT HELP ==============="
-
-          localport --help || true
-
-          echo "Localport installation completed."
-
-      - name: Start tunnel with detailed diagnostics
+      - name: Start tunnel and publish connection details
         shell: bash
         env:
           LOCALPORT_TOKEN: ${{ secrets.LOCALPORT_TOKEN }}
         run: |
           set -Eeuo pipefail
 
-          echo "========== TUNNEL DIAGNOSTICS ==========="
-          date -u
+          echo "========== TUNNEL DIAGNOSTICS =========="
 
           if [ -z "${LOCALPORT_TOKEN:-}" ]; then
             echo "ERROR: LOCALPORT_TOKEN secret is missing."
             exit 1
           fi
 
-          echo "Checking local SSH port..."
-
-          if ! sudo ss -lnt | grep -E '[:.]3000[[:space:]]'; then
-            echo "ERROR: SSH is not listening on port 3000."
-            sudo systemctl status ssh --no-pager || true
+          if [ ! -s "$RUNNER_TEMP/ssh_root_password" ]; then
+            echo "ERROR: SSH password file is missing."
             exit 1
           fi
 
-          echo "Local SSH port is listening."
-
-          echo "========== TOKEN FILE ==================="
-
+          # Localport requires a private token file.
           TOKEN_FILE="$RUNNER_TEMP/localport-token"
+          LOG_FILE="$RUNNER_TEMP/localport.log"
 
           umask 077
           printf '%s' "$LOCALPORT_TOKEN" > "$TOKEN_FILE"
           chmod 600 "$TOKEN_FILE"
-
           unset LOCALPORT_TOKEN
 
           export LOCALPORT_TOKEN_FILE="$TOKEN_FILE"
           export NO_COLOR=1
           export TERM=dumb
 
-          echo "Token stored in a private temporary file."
-          echo "Token contents will not be printed."
-          echo "Automatic restart: disabled."
-          echo "Tunnel invocations: one."
-          echo "Local address: localhost:3000"
+          : > "$LOG_FILE"
+          chmod 600 "$LOG_FILE"
+
+          echo "Local SSH port: 3000"
           echo "Region: eu"
+          echo "Automatic retries: disabled"
+          echo "Tunnel invocations: one"
+          echo "Waiting for Localport to report the public address..."
 
-          echo "========== STARTING LOCALPORT ==========="
+          # Launch exactly one Localport process.
+          localport tcp 3000 --region eu --noui \
+            > >(tee -a "$LOG_FILE") 2>&1 &
+          TUNNEL_PID=$!
 
-          START_TIME="$(date +%s)"
+          cleanup() {
+            kill "$TUNNEL_PID" 2>/dev/null || true
+            wait "$TUNNEL_PID" 2>/dev/null || true
+            rm -f "$TOKEN_FILE"
+          }
 
+          trap cleanup EXIT INT TERM
+
+          ADDRESS=""
+          PASSWORD="$(cat "$RUNNER_TEMP/ssh_root_password")"
+
+          # Wait for the actual forwarding address or process exit.
+          # This loop does not restart Localport.
+          while kill -0 "$TUNNEL_PID" 2>/dev/null; do
+            if grep -q 'connected .*tcp://' "$LOG_FILE"; then
+              ADDRESS="$(
+                sed -nE \
+                  's/.*connected .*tcp:\/\/([^[:space:]]+).*/\1/p' \
+                  "$LOG_FILE" | tail -n 1
+              )"
+
+              if [[ "$ADDRESS" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]]; then
+                break
+              fi
+            fi
+
+            sleep 1
+          done
+
+          if [ -n "$ADDRESS" ]; then
+            SSH_HOST="${ADDRESS%:*}"
+            SSH_PORT="${ADDRESS##*:}"
+
+            echo
+            echo "========== SSH CONNECTION DETAILS =========="
+            echo "Host: $SSH_HOST"
+            echo "Port: $SSH_PORT"
+            echo "Username: root"
+            echo "Password: [hidden in logs]"
+            echo
+
+            {
+              echo "## SSH Connection Details"
+              echo
+              echo "The Localport tunnel reported a public address."
+              echo
+              echo '```text'
+              echo "Host: ${SSH_HOST}"
+              echo "Port: ${SSH_PORT}"
+              echo "Username: root"
+              echo "Password: ${PASSWORD}"
+              echo '```'
+              echo
+              echo "Connect with:"
+              echo
+              echo '```bash'
+              printf 'ssh root@%s -p %s\n' "$SSH_HOST" "$SSH_PORT"
+              echo '```'
+              echo
+              echo "Keep these credentials private."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ERROR: Localport exited before reporting a valid address."
+            echo "Review the Localport output above."
+
+            {
+              echo "## Tunnel startup failed"
+              echo
+              echo "No valid forwarding address was detected."
+              echo "Review the workflow logs for the Localport error."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Keep the tunnel alive; never start a second process.
           set +e
-          localport tcp 3000 --region eu --noui
+          wait "$TUNNEL_PID"
           EXIT_CODE=$?
           set -e
 
-          END_TIME="$(date +%s)"
-          DURATION=$((END_TIME - START_TIME))
-
-          echo "========== LOCALPORT EXIT REPORT ========"
-          echo "Start time: $(date -u -d "@$START_TIME" '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "End time:   $(date -u -d "@$END_TIME" '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "Duration:   ${DURATION} seconds"
-          echo "Exit code:  ${EXIT_CODE}"
-
-          echo "========== SSH SERVICE AFTER EXIT ========"
-          sudo systemctl status ssh --no-pager || true
-
-          echo "========== PORT STATUS AFTER EXIT ======="
-          sudo ss -lntp || true
-
-          echo "========== RECENT SSH LOGS ==============="
-          sudo journalctl -u ssh --no-pager -n 50 || true
-
-          rm -f "$TOKEN_FILE"
+          echo "========== LOCALPORT EXIT =========="
+          echo "Exit code: $EXIT_CODE"
+          date -u
 
           if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "ERROR: Localport exited with a non-zero status."
-            echo "Review the Localport logs above."
+            echo "ERROR: Localport exited with an error."
             exit "$EXIT_CODE"
           fi
 
